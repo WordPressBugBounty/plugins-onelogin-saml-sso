@@ -147,6 +147,13 @@ function saml_sso() {
 	}
 
 	if (is_user_logged_in()) {
+		if (isset($_GET["target"])) {
+			wp_redirect($_GET["target"]);
+			exit();
+		} else if (isset($_GET['redirect_to'])) {
+			wp_redirect($_GET['redirect_to']);
+			exit();
+		}
 		return true;
 	}
 	$auth = initialize_saml();
@@ -160,7 +167,7 @@ function saml_sso() {
 	} else if (isset($_GET['redirect_to'])) {
 		$auth->login($_GET['redirect_to']);
 	} else if (isset($_SERVER['REQUEST_URI']) && !isset($_GET['saml_sso'])) {
-		$auth->login($_SERVER['REQUEST_URI']);
+		$auth->login(sanitize_text_field( $_SERVER['REQUEST_URI']));
 	} else {
 		$auth->login();
 	}
@@ -182,8 +189,8 @@ function saml_slo() {
 			$nameId = null;
 			$sessionIndex = null;
 			$nameIdFormat = null;
-			$samlNameIdNameQualifier = null;
-			$samlNameIdSPNameQualifier = null;
+			$nameIdNameQualifier = null;
+			$nameIdSPNameQualifier = null;
 
 			if (isset($_COOKIE[SAML_NAMEID_COOKIE])) {
 				$nameId = sanitize_text_field($_COOKIE[SAML_NAMEID_COOKIE]);
@@ -206,6 +213,7 @@ function saml_slo() {
 				wp_redirect(home_url());
 				exit();
 			}
+			
 			$auth->logout(home_url(), array(), $nameId, $sessionIndex, false, $nameIdFormat, $nameIdNameQualifier, $nameIdSPNameQualifier);
 			return false;
 		}
@@ -283,27 +291,45 @@ function saml_acs() {
 		exit();
 	}
 
-	$attrs = $auth->getAttributes();
+	$useFriendlyName = get_option('onelogin_saml_advanced_settings_use_friendlyname', false);
+	if ($useFriendlyName) {
+		$attrs = $auth->getAttributesWithFriendlyName();
+	} else {
+		$attrs = $auth->getAttributes();
+	}
 
+	$username = $email = '';
 	if (empty($attrs)) {
 		$nameid = $auth->getNameId();
 		if (empty($nameid)) {
 			echo __("The SAMLResponse may contain NameID or AttributeStatement");
 			exit();
 		}
-		$username = sanitize_user($nameid);
-		$email = sanitize_email($nameid);
+		$username = $nameid;
+		$email = $nameid;
 	} else {
 		$usernameMapping = get_option('onelogin_saml_attr_mapping_username');
 		$mailMapping =  get_option('onelogin_saml_attr_mapping_mail'); 
 
 		if (!empty($usernameMapping) && isset($attrs[$usernameMapping]) && !empty($attrs[$usernameMapping][0])){
-			$username = sanitize_user($attrs[$usernameMapping][0]);
+			$username = $attrs[$usernameMapping][0];
 		}
 		if (!empty($mailMapping) && isset($attrs[$mailMapping])  && !empty($attrs[$mailMapping][0])){
-			$email = sanitize_email($attrs[$mailMapping][0]);
+			$email = $attrs[$mailMapping][0];
 		}
 	}
+
+	$preventAccents = get_option('onelogin_saml_prevent_accents', false);
+	if ($preventAccents) {
+		$email_without_accents = remove_accents($email);
+		if ($email_without_accents !== $email) {
+			echo __("Emails with accents are not allowed");
+			exit();
+		}
+	}
+
+	$username = sanitize_user($username);
+	$email = sanitize_email($email);
 
 	if (empty($username)) {
 		echo __("The username could not be retrieved from the IdP and is required");
@@ -317,8 +343,9 @@ function saml_acs() {
 		exit();
 	} else {
 		$userdata = array();
-		$userdata['user_login'] = wp_slash($username);
-		$userdata['user_email'] = wp_slash($email);
+
+		$userdata['user_login'] = wp_unslash($username);
+		$userdata['user_email'] = wp_unslash($email);
 	}
 
 	if (!empty($attrs)) {
@@ -396,6 +423,8 @@ function saml_acs() {
 		$user_id = email_exists($matcherValue);
 	}
 
+	do_action('onelogin_saml_attrs_pre_setup_user', $attrs);
+
 	if ($user_id) {
 		if (is_multisite()) {
 			if (get_site_option('onelogin_network_saml_global_jit')) {
@@ -461,7 +490,7 @@ function saml_acs() {
 				add_roles_to_user($user_id, $roles);
 			}
 		}
-	} else {
+	} elseif (apply_filters('onelogin_saml_show_no_user_error_response', true)) {
 		echo __("User provided by the IdP "). ' "'. esc_attr($matcherValue). '" '. __("does not exist in wordpress and auto-provisioning is disabled.");
 		exit();
 	}
@@ -474,12 +503,10 @@ function saml_acs() {
 		exit();
 	} else if ($user_id) {
 		wp_set_current_user($user_id);
+
+		do_action( 'onelogin_saml_attrs', $attrs, wp_get_current_user(), get_current_user_id(), $newuser);
 		
-		$rememberme = false;
-		$remembermeMapping = get_option('onelogin_saml_attr_mapping_rememberme');
-		if (!empty($remembermeMapping) && isset($attrs[$remembermeMapping]) && !empty($attrs[$remembermeMapping][0])) {
-			$rememberme = in_array($attrs[$remembermeMapping][0], array(1, true, '1', 'yes', 'on')) ? true : false;
-		}
+		$rememberme = (boolean) get_option('onelogin_saml_rememberme', false);
 		wp_set_auth_cookie($user_id, $rememberme);
 
 		$secure = is_ssl();
@@ -490,8 +517,6 @@ function saml_acs() {
 		setcookie(SAML_NAMEID_NAME_QUALIFIER_COOKIE, $auth->getNameIdNameQualifier(), time() + MONTH_IN_SECONDS, SITECOOKIEPATH, COOKIE_DOMAIN, $secure, true);
 		setcookie(SAML_NAMEID_SP_NAME_QUALIFIER_COOKIE, $auth->getNameIdSPNameQualifier(), time() + MONTH_IN_SECONDS, SITECOOKIEPATH, COOKIE_DOMAIN, $secure, true);
 	}
-
-	do_action( 'onelogin_saml_attrs', $attrs, wp_get_current_user(), get_current_user_id(), $newuser);
 
 	// Trigger the wp_login hook used by wp_signon()
 	// @see https://developer.wordpress.org/reference/hooks/wp_login/
@@ -509,7 +534,7 @@ function saml_acs() {
 		$relayState = esc_url_raw( $_REQUEST['RelayState'], ['https','http']);
 
 		if (!empty($relayState) && ((substr($relayState, -strlen('/wp-login.php')) === '/wp-login.php') || (substr($relayState, -strlen('/alternative_acs.php')) === '/alternative_acs.php'))) {
-			wp_redirect(home_url());
+			wp_redirect( apply_filters('onelogin_saml_after_login_redirect_url', home_url()) );
 		} else {
 			if (strpos($relayState, 'redirect_to') !== false) {
 				$query = wp_parse_url($relayState, PHP_URL_QUERY);
@@ -520,7 +545,7 @@ function saml_acs() {
 			}
 		}
 	} else {
-		wp_redirect(home_url());
+		wp_redirect( apply_filters('onelogin_saml_after_login_redirect_url', home_url()) );
 	}
 	exit();
 }
@@ -635,7 +660,7 @@ function enroll_user_on_sites($user_id, $roles) {
 	$opts = array('number' => 1000);
 	$sites = get_sites($opts);
 	foreach ($sites as $site) {
-		if (get_blog_option($site_id, "onelogin_saml_autocreate") && !is_user_member_of_blog($user_id, $site->id)) {
+		if (get_blog_option($site->id, "onelogin_saml_autocreate") && !is_user_member_of_blog($user_id, $site->id)) {
 			foreach($roles as $role) {
 				add_user_to_blog($site->id, $user_id, $role);
 			}
@@ -652,6 +677,15 @@ function enroll_user_on_blogs($blog_id, $user_id, $roles) {
 function update_user_role($user_id, $roles)
 {
 	$user = get_user_by('id', $user_id);
+
+	if (get_option('onelogin_saml_role_mapping_preserve_existing', false)) {
+		// Keep roles and per-user capabilities assigned outside the role mapping
+		foreach($roles as $role) {
+			$user->add_role($role);
+		}
+		return;
+	}
+
 	$role = array_shift($roles);
 	$user->set_role($role);	// This removes previous assignations
 
